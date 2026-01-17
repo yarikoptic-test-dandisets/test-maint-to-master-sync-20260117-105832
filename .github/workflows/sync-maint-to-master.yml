@@ -1,0 +1,213 @@
+name: Sync maint → master
+
+on:
+  push:
+    branches: [maint]
+  pull_request:
+    branches: [master]
+    types: [closed]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch latest branches
+        run: |
+          git fetch origin maint master
+
+      - name: Check if sync is needed
+        id: check_sync
+        run: |
+          # Use remote refs to avoid issues with checked-out branches
+          if git merge-base --is-ancestor origin/master origin/maint; then
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Master is ancestor of maint - no PR needed"
+            exit 0
+          fi
+
+          echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+
+          MAINT_HASH=$(git rev-parse origin/maint)
+          MERGE_BASE=$(git merge-base origin/maint origin/master)
+
+          if [ "$MERGE_BASE" = "$MAINT_HASH" ]; then
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️  Maint has no new commits"
+          else
+            echo "maint_ahead=true" >> "$GITHUB_OUTPUT"
+            echo "📦 Maint has new commits to sync"
+          fi
+
+      - name: Exit early if no sync needed
+        if: steps.check_sync.outputs.needs_sync == 'false'
+        run: echo "Nothing to do - exiting successfully"
+
+      - name: Check for existing PR
+        if: steps.check_sync.outputs.needs_sync == 'true'
+        id: check_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_DATA=$(gh pr list \
+            --head maint-to-master \
+            --base master \
+            --state open \
+            --json number,mergeable \
+            --jq '.[0]')
+
+          if [ -n "$PR_DATA" ] && [ "$PR_DATA" != "null" ]; then
+            PR_NUMBER=$(echo "$PR_DATA" | jq -r '.number')
+            echo "pr_exists=true" >> "$GITHUB_OUTPUT"
+            echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "📋 Found existing PR #$PR_NUMBER"
+          else
+            echo "pr_exists=false" >> "$GITHUB_OUTPUT"
+            echo "📝 No existing PR found"
+          fi
+
+      - name: Determine branch strategy
+        if: steps.check_sync.outputs.needs_sync == 'true'
+        id: branch_strategy
+        run: |
+          if [ "${{ steps.check_pr.outputs.pr_exists }}" = "false" ]; then
+            echo "strategy=create" >> "$GITHUB_OUTPUT"
+          else
+            git fetch origin maint-to-master 2>/dev/null || {
+              echo "strategy=create" >> "$GITHUB_OUTPUT"
+              exit 0
+            }
+
+            MAINT_HASH=$(git rev-parse origin/maint)
+            BRANCH_HASH=$(git rev-parse origin/maint-to-master)
+
+            if [ "$BRANCH_HASH" = "$MAINT_HASH" ]; then
+              echo "strategy=force_reset" >> "$GITHUB_OUTPUT"
+            else
+              echo "strategy=merge_forward" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Create or update maint-to-master branch
+        if: steps.check_sync.outputs.needs_sync == 'true'
+        id: update_branch
+        run: |
+          STRATEGY="${{ steps.branch_strategy.outputs.strategy }}"
+
+          if [ "$STRATEGY" = "create" ] || [ "$STRATEGY" = "force_reset" ]; then
+            # Create branch from origin/maint
+            git checkout -B maint-to-master origin/maint
+
+            # Try to merge origin/master into it
+            if git merge origin/master --no-edit -m "Merge master into maint-to-master"; then
+              echo "merge_status=clean" >> "$GITHUB_OUTPUT"
+              echo "✅ Clean merge"
+            else
+              echo "merge_status=conflict" >> "$GITHUB_OUTPUT"
+              echo "⚠️  Merge conflicts"
+              git merge --abort
+              # Reset to maint without the merge
+              git checkout -B maint-to-master origin/maint
+            fi
+
+            git push -f origin maint-to-master
+
+          elif [ "$STRATEGY" = "merge_forward" ]; then
+            # Check out existing branch
+            git checkout -B maint-to-master origin/maint-to-master
+
+            # Merge new maint commits
+            if git merge origin/maint --no-edit -m "Merge new maint commits"; then
+              echo "merge_status=clean" >> "$GITHUB_OUTPUT"
+              git push origin maint-to-master
+            else
+              echo "merge_status=conflict" >> "$GITHUB_OUTPUT"
+              git push origin maint-to-master || true
+            fi
+          fi
+
+      - name: Create PR
+        if: steps.check_sync.outputs.needs_sync == 'true' && steps.check_pr.outputs.pr_exists == 'false'
+        id: create_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MERGE_STATUS="${{ steps.update_branch.outputs.merge_status }}"
+
+          if [ "$MERGE_STATUS" = "conflict" ]; then
+            STATUS_NOTE="⚠️ **MERGE CONFLICTS** - Manual resolution required"
+            AUTO_MERGE_ENABLE="false"
+          else
+            STATUS_NOTE="✅ Clean merge - will auto-merge when CI passes"
+            AUTO_MERGE_ENABLE="true"
+          fi
+
+          COMMIT_COUNT=$(git log --oneline origin/master..maint-to-master | wc -l)
+
+          PR_NUMBER=$(gh pr create \
+            --base master \
+            --head maint-to-master \
+            --title "Sync maint → master ($COMMIT_COUNT commits)" \
+            --body "$(cat <<EOF
+          ## 🔄 Automated Maintenance Sync
+
+          **Status:** $STATUS_NOTE
+
+          **Commits from maint:** $COMMIT_COUNT
+
+          ### Changes
+          \`\`\`
+          $(git log --oneline --graph origin/master..maint-to-master | head -10)
+          \`\`\`
+
+          🤖 Auto-generated by sync-maint-to-master workflow
+          EOF
+          )" --json number --jq '.number')
+
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "auto_merge=$AUTO_MERGE_ENABLE" >> "$GITHUB_OUTPUT"
+
+      - name: Update existing PR
+        if: steps.check_sync.outputs.needs_sync == 'true' && steps.check_pr.outputs.pr_exists == 'true'
+        id: update_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ steps.check_pr.outputs.pr_number }}"
+          MERGE_STATUS="${{ steps.update_branch.outputs.merge_status }}"
+
+          if [ "$MERGE_STATUS" = "conflict" ]; then
+            MESSAGE="🔄 Updated - ⚠️ Conflicts detected"
+            AUTO_MERGE_ENABLE="false"
+          else
+            MESSAGE="🔄 Updated - ✅ Clean merge"
+            AUTO_MERGE_ENABLE="true"
+          fi
+
+          gh pr comment "$PR_NUMBER" --body "$MESSAGE"
+          echo "auto_merge=$AUTO_MERGE_ENABLE" >> "$GITHUB_OUTPUT"
+
+      - name: Enable auto-merge
+        if: steps.check_sync.outputs.needs_sync == 'true' && (steps.create_pr.outputs.auto_merge == 'true' || steps.update_pr.outputs.auto_merge == 'true')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ steps.create_pr.outputs.pr_number || steps.check_pr.outputs.pr_number }}"
+          gh pr merge "$PR_NUMBER" --auto --merge || echo "Auto-merge may already be enabled"
